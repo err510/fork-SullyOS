@@ -13,11 +13,9 @@ import { startStt, isSttSupported, type SttSession } from '../utils/speechToText
 import { ContextBuilder } from '../utils/context';
 import { resolveCharTimeZone } from '../utils/timezone';
 import {
-  getMemoryPalaceHighWaterMark,
   injectMemoryPalace,
-  mergePalaceFragmentsIntoMemories,
-  processNewMessages,
 } from '../utils/memoryPalace/pipeline';
+import { processNewMessagesWithAutoArchive } from '../utils/memoryPalace/autoArchive';
 import { incrementDigestRound, runCognitiveDigestion } from '../utils/memoryPalace';
 import { RealtimeContextManager } from '../utils/realtimeContext';
 import { DB } from '../utils/db';
@@ -353,7 +351,7 @@ const CallApp: React.FC = () => {
   charactersRef.current = characters;
   // 通话内容和普通聊天写进同一份历史，也就是主动消息 2.0 云端快照的素材。每轮落库后打一次脏，
   // 不然打完电话直接关 App，角色到点就当这通电话没发生过（连"这段时间没联系"都会算错）。
-  // 去抖会把一通电话里的多次调用合并成一次上传；快照里的消息在上传时从 DB 重读。
+  // 一通电话里的多次调用会在微任务内合并成一次上传；快照里的消息在上传时从 DB 重读。
   const markCallTurnDirty = () => {
     if (!selectedChar) return;
     markAmsgStateDirty({ char: selectedChar, userProfile, groups, realtimeConfig });
@@ -371,7 +369,7 @@ const CallApp: React.FC = () => {
 
     try {
       const recentMessages = await DB.getRecentMessagesByCharId(charForHook.id, 50);
-      const result = await processNewMessages(
+      await processNewMessagesWithAutoArchive(
         recentMessages,
         charForHook.id,
         charForHook.name,
@@ -384,23 +382,6 @@ const CallApp: React.FC = () => {
 
       const liveAfter = charactersRef.current.find(char => char.id === charForHook.id) || null;
       if (!liveAfter?.memoryPalaceEnabled) return;
-
-      if (liveAfter.autoArchiveEnabled) {
-        const patch: Partial<CharacterProfile> = {};
-        if (result?.autoArchive) {
-          patch.memories = mergePalaceFragmentsIntoMemories(
-            liveAfter.memories || [],
-            result.autoArchive.fragments,
-          );
-        }
-        const highWaterMark = getMemoryPalaceHighWaterMark(charForHook.id);
-        if (highWaterMark > (liveAfter.hideBeforeMessageId || 0)) {
-          patch.hideBeforeMessageId = highWaterMark;
-        }
-        if (Object.keys(patch).length > 0) {
-          updateCharacter(charForHook.id, patch);
-        }
-      }
 
       if (incrementDigestRound(charForHook.id)) {
         setMemoryPalaceStatus(`${charForHook.name}正在整理内心…`);
@@ -772,7 +753,8 @@ const CallApp: React.FC = () => {
         metadata: { source: 'call-end-popup', callSessionId: currentSessionId, ...payload },
       });
       await loadCallRecords(selectedChar.id);
-      // 挂断这一下最要紧：用户多半接着就把 App 关了，去抖窗口里的那些打脏还没冲刷。
+      // 挂断这一下最要紧：用户多半接着就把 App 关了，得把这最后一条也打脏——
+      // 打脏即传，微任务内就会冲刷上传。
       markCallTurnDirty();
       void runMemoryPalacePostHook(selectedChar);
     }
