@@ -12,11 +12,12 @@ describe('CompanionHome touch request boundaries', () => {
     expect(source).not.toContain('requestAvatarTouchReply');
     expect(source).not.toContain('DB.saveMessage');
   });
-  it('makes one touch-pack model attempt with no automatic repair or retry', () => {
+  it('makes one touch-pack model attempt without retry or an artificial 60s cutoff', () => {
     const touchSource = readFileSync(path.resolve(__dirname, './avatarTouch.ts'), 'utf8');
 
     expect(touchSource).toContain("purpose: '一次性生成桌面触摸反馈包（不重试）'");
-    expect(touchSource).toContain('}, 0, 60_000, {');
+    expect(touchSource).toContain('}, 0, 0, {');
+    expect(touchSource).not.toContain('}, 0, 60_000, {');
     expect(touchSource).not.toContain('自动补全缺失部位');
     expect(touchSource).not.toContain('requestForZones');
     expect(touchSource).not.toContain('repairData');
@@ -117,7 +118,9 @@ describe('CompanionHome touch request boundaries', () => {
     expect(source).not.toContain('data-testid="companion-layout-picker"');
     expect(source).not.toContain('data-testid="companion-layout-editor"');
     expect(source).toContain('data-testid="companion-character-crop-editor"');
-    expect(source).toContain('showCropGuide={editing && editingPanel === \'character\'}');
+    expect(source).toContain('showCropGuide={editing && editingPanel === \'character\' && compositionFramingMode === \'base\'}');
+    expect(source).toContain('data-testid="companion-face-anchor-mode"');
+    expect(source).toContain('faceFraming: faceAnchorDraftEnabled ? faceFramingDraft : undefined');
     expect(source).toContain('data-testid="companion-appearance-rail-button"');
     expect(source).toContain('data-testid="companion-real-wardrobe-button"');
     expect(source).toContain('<CompanionWardrobeDrawer');
@@ -283,6 +286,7 @@ describe('CompanionHome touch request boundaries', () => {
   });
 
   it('makes imported Live2D outfits an explicit manual-only wardrobe workflow', () => {
+    const source = readFileSync(path.resolve(__dirname, '../components/os/CompanionHome.tsx'), 'utf8');
     const typeSource = readFileSync(path.resolve(__dirname, '../types.ts'), 'utf8');
     const callSource = readFileSync(path.resolve(__dirname, '../apps/CallApp.tsx'), 'utf8');
     const settingsSource = readFileSync(path.resolve(__dirname, '../components/call/Live2DActionSettings.tsx'), 'utf8');
@@ -304,6 +308,10 @@ describe('CompanionHome touch request boundaries', () => {
     expect(stageSource).toContain('!action.wardrobe');
     expect(wardrobeSource).toContain('data-testid="companion-real-wardrobe"');
     expect(wardrobeSource).toContain('onOpenComposition');
+    expect(wardrobeSource).toContain('data-testid="companion-wardrobe-delete-confirm"');
+    expect(wardrobeSource).toContain('onLongPress');
+    expect(source).toContain('storeCompanionModelOutfit(character, model)');
+    expect(source).not.toContain('|| avatar.actions.find(item => item.wardrobe)');
   });
 
   it('teaches the wardrobe scene entry once and keeps it available for static portraits', () => {
