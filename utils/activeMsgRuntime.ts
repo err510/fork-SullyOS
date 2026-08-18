@@ -554,7 +554,7 @@ const processInboxMessageWithPostProcessing = async (
   // 若传全量表情，名字冲突时会把 A 的 [[SEND_EMOJI: x]] 匹配到 B 名下的同名表情，导致
   // A 发出绑定给 B 的表情包。本地聊天路径喂的是 aiVisibleEmojis（已过滤），主动消息路径
   // 之前漏了这步，这里复用同一套过滤收口（与 activeMsgClient.buildCompletePrompt 对齐）。
-  const { emojis } = ChatPrompts.filterVisibleEmojis(
+  const { emojis, categories } = ChatPrompts.filterVisibleEmojis(
     await DB.getEmojis(),
     await DB.getEmojiCategories(),
     message.charId,
@@ -661,6 +661,7 @@ const processInboxMessageWithPostProcessing = async (
     char,
     userProfile,
     emojis,
+    categories,
     realtimeConfig,
     contextMsgs,
     // fullMessages / initialData: worker 不会传过来 (Phase 2 才有续跑), 二轮 LLM 又被关掉,
@@ -2384,7 +2385,9 @@ const handleDeepLink = () => {
   if (charId !== null || openApp !== null) {
     currentUrl.searchParams.delete('openApp');
     currentUrl.searchParams.delete('activeMsgCharId');
-    window.history.replaceState({}, '', currentUrl.toString());
+    // Keep same-page navigation markers (for example the browser back guard)
+    // while removing only the consumed deep-link parameters from the URL.
+    window.history.replaceState(window.history.state, '', currentUrl.toString());
   }
 };
 

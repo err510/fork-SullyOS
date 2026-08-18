@@ -1,6 +1,6 @@
 
 import React, { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
-import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGroup, ChatTheme, Toast, FullBackupData, UserProfile, ApiPreset, GroupProfile, SystemLog, Worldbook, NovelBook, SongSheet, Message, RealtimeConfig, AppearancePreset, CloudBackupConfig, CloudBackupFile } from '../types';
+import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGroup, ChatTheme, Toast, FullBackupData, UserProfile, ApiPreset, GroupProfile, SystemLog, Worldbook, NovelBook, SongSheet, Message, RealtimeConfig, AppearancePreset, CloudBackupConfig, CloudBackupFile, MemoryPalaceFeatureFlags } from '../types';
 import { DB } from '../utils/db';
 import type { AvatarTouchRecord } from '../utils/avatarTouch';
 import { clampClaudeTemperature, modelRejectsSamplingParams, stripSamplingParams } from '../utils/samplingParamCompat';
@@ -13,6 +13,9 @@ import { stripCompanionChatStyleResidue } from '../utils/companionThemeIsolation
 import { SULLY_DEFAULT_AVATAR_URL, shouldMigrateSullyAvatar } from '../utils/sullyAvatar';
 import { exportStoryTheaterAppearanceSetting, restoreStoryTheaterAppearanceSetting } from '../utils/storyTheaterBackup';
 import { createV2ArrayFieldWriter, writeV2Backup, assembleV2Backup, type BackupManifest, type ZipFileWriter, type ZipFileReader } from '../utils/backupFormat';
+import { externalizeVoiceMessageBlobs, restoreVoiceMessageBlobs, shouldIncludeVoiceRelatedAssetInBackup } from '../utils/voiceMessageBackup';
+import { ensureCompanionVoiceAssetsForBackup, isCompanionVoiceAssetId } from '../utils/companionVoiceAssets';
+import { collectCharacterCompanionVoiceAssetIds } from '../utils/companionPresets';
 import { encodeVectorsForBackup, encodeVectorsForBackupChunked } from '../utils/memoryPalace/db';
 import { ProactiveChat } from '../utils/proactiveChat';
 import { VRScheduler, type VRSessionOutcome } from '../utils/vrWorld/scheduler';
@@ -27,7 +30,7 @@ import { safeFetchJson } from '../utils/safeApi';
 import { captureApiRequestOnce, getApiCallAmbientContext, recordApiCall, setApiCallAmbientContext, updateApiRequestCaptureUsage } from '../utils/apiCallLog';
 import { isGlobalStreamEnabled, upgradeChatBodyToStream, assembleUpgradedResponse } from '../utils/streamUpgrade';
 import { rewriteStaleWorkerUrl } from '../utils/proxyWorker';
-import { buildFetchFailureDetail, classifyFetchFailure, describeReachabilityProbe, parseTargetUrl, probeOriginReachability, shouldProbeReachability } from '../utils/networkFailureDiagnosis';
+import { buildFetchFailureDetail, classifyFetchFailure, describeReachabilityProbe, parseTargetUrl, probeOriginReachability, shouldProbeReachability, summarizeFetchRequestBody } from '../utils/networkFailureDiagnosis';
 import { INSTALLED_APPS, HIDDEN_APP_NAMES } from '../constants';
 import { isAnalyticsRequestUrl, trackEvent, trackDataScaleOnce, trackCurrentAppearanceOnce, trackCurrentCharSettingsOnce, trackCurrentFeaturesOnce } from '../utils/analytics';
 import { collectAppearance, collectCharSettings, collectDataScale, collectFeatureFlagsAsync } from '../utils/analyticsSnapshot';
@@ -258,13 +261,23 @@ export interface MemoryPalaceGlobalConfig {
     model: string;
     topN: number; // 额外召回条数（去重后追加到主 15 条后面）
   };
+  /** 实验功能默认全关；每轮召回会把当时的值冻结进 Trace。 */
+  featureFlags: MemoryPalaceFeatureFlags;
 }
 
 const defaultMemoryPalaceConfig: MemoryPalaceGlobalConfig = {
   embedding: { baseUrl: '', apiKey: '', model: 'BAAI/bge-m3', dimensions: 1024 },
   lightLLM: { baseUrl: '', apiKey: '', model: '' },
   rerank: { enabled: false, baseUrl: '', apiKey: '', model: 'BAAI/bge-reranker-v2-m3', topN: 5 },
+  featureFlags: { recallRouter: false, interactionAdaptation: false, deepEngagement: false, epistemicState: false },
 };
+
+const normalizeMemoryPalaceConfig = (value?: Partial<MemoryPalaceGlobalConfig> | null): MemoryPalaceGlobalConfig => ({
+  embedding: { ...defaultMemoryPalaceConfig.embedding, ...(value?.embedding || {}) },
+  lightLLM: { ...defaultMemoryPalaceConfig.lightLLM, ...(value?.lightLLM || {}) },
+  rerank: { ...defaultMemoryPalaceConfig.rerank, ...(value?.rerank || {}) },
+  featureFlags: { ...defaultMemoryPalaceConfig.featureFlags, ...(value?.featureFlags || {}) },
+});
 
 /** deleteCharacter 的结果：cloud-cleanup-failed = 云端还有任务没清掉，本地没删。 */
 export type DeleteCharacterResult = { status: 'deleted' } | { status: 'cloud-cleanup-failed' };
@@ -880,7 +893,12 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   const [apiPresets, setApiPresets] = useState<ApiPreset[]>([]);
   const [realtimeConfig, setRealtimeConfig] = useState<RealtimeConfig>(defaultRealtimeConfig);
   const [memoryPalaceConfig, setMemoryPalaceConfig] = useState<MemoryPalaceGlobalConfig>(() => {
-    try { const s = localStorage.getItem('os_memory_palace_config'); return s ? { ...defaultMemoryPalaceConfig, ...JSON.parse(s) } : defaultMemoryPalaceConfig; } catch { return defaultMemoryPalaceConfig; }
+    try {
+      const saved = localStorage.getItem('os_memory_palace_config');
+      return normalizeMemoryPalaceConfig(saved ? JSON.parse(saved) : undefined);
+    } catch {
+      return normalizeMemoryPalaceConfig();
+    }
   });
   const defaultRemoteVectorConfig = { enabled: false, supabaseUrl: '', supabaseAnonKey: '', initialized: false };
   const [remoteVectorConfig, setRemoteVectorConfig] = useState(() => {
@@ -1049,6 +1067,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
       // 1. Monkey Patch Fetch
       const originalFetch = window.fetch;
+      // “同一 API 在别的模式刚成功”是排查 CORS 包装错误最有价值的对照证据。
+      // 只记 method + URL + 状态与时间，不保存请求正文。
+      const recentSuccessfulFetches = new Map<string, { timestamp: number; status: number }>();
       const patchedFetch = async (...args: [RequestInfo | URL, RequestInit?]) => {
           const [resource, config] = args;
           
@@ -1068,6 +1089,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // App now; reading the ambient value after a long response would label
           // the request as whichever App the user navigated to in the meantime.
           const ambientMetaAtStart = getApiCallAmbientContext();
+          const method = ((config as RequestInit | undefined)?.method
+              || (typeof Request !== 'undefined' && resource instanceof Request ? resource.method : 'GET'))
+              .toUpperCase();
+          const requestComparisonKey = `${method} ${urlStr}`;
 
           // 采样参数兼容层（详见 utils/samplingParamCompat.ts）：
           // 某些模型废弃了 temperature/top_p/top_k，带上直接 400。这里在所有 /chat/completions
@@ -1143,6 +1168,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   if (usageClone) {
                       usageClone.text().then((t) => {
                           const durationMs = Date.now() - fetchStartedAt;
+                          // 一定要等正文完整读完再记成功；只拿到 200 响应头、随后 SSE 断流
+                          // 正是这次剧情故障的形态，不能拿它反过来当成功对照。
+                          if (ok) recentSuccessfulFetches.set(requestComparisonKey, { timestamp: Date.now(), status });
                           let parsed: any = undefined;
                           try { parsed = JSON.parse(t); } catch { /* 流式/非 JSON：把原始文本交给 recordApiCall 的 SSE 兜底解析 */ }
                           updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok, response: parsed, responseText: parsed === undefined ? t : undefined });
@@ -1152,6 +1180,8 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                           recordApiCall({ requestId, url: urlStr, body, status, ok, meta, durationMs: Date.now() - fetchStartedAt });
                       });
                   } else {
+                      // clone 失败时，只有已经在上面完整拼装过的升级流才能确认正文收完。
+                      if (ok && streamUpgraded) recentSuccessfulFetches.set(requestComparisonKey, { timestamp: Date.now(), status });
                       updateApiRequestCaptureUsage({ captureId: apiRequestCaptureId, ok });
                       recordApiCall({ requestId, url: urlStr, body, status, ok, meta, durationMs: Date.now() - fetchStartedAt });
                   }
@@ -1208,14 +1238,16 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   // 结论回填到同一条日志上——「网络不通」和「网络通但响应被 CORS 拦」要走的排查路
                   // 完全相反，不分开的话用户只能瞎试。详见 utils/networkFailureDiagnosis.ts。
                   const logId = `log-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                  const method = (typeof Request !== 'undefined' && resource instanceof Request)
-                      ? resource.method
-                      : ((config as RequestInit | undefined)?.method || 'GET');
+                  const requestMeta = (sendArgs[1] as any)?.__sullyMeta || ambientMetaAtStart;
+                  const recentSuccess = recentSuccessfulFetches.get(requestComparisonKey);
                   const baseDetail = buildFetchFailureDetail({
                       url: urlStr,
                       method,
                       durationMs: Date.now() - fetchStartedAt,
                       error: err,
+                      requestSummary: summarizeFetchRequestBody((sendArgs[1] as any)?.body),
+                      requestPurpose: requestMeta?.purpose,
+                      recentSuccessfulSameRequest: recentSuccess,
                   }, { startedAt: fetchStartedAtPerf });
                   setSystemLogs(prev => [{
                       id: logId,
@@ -2218,6 +2250,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   emojis, categories,
                   historyMsgs: allMsgs,
                   contextLimit: Math.max(1, allMsgs.length),
+                  recallEntryPoint: 'proactive_chat',
                   realtimeConfig: currentRealtimeConfig,
                   innerState: cachedInnerState,
                   // 实时音乐播放状态 —— OSContext 在 MusicProvider 上层用不了 useMusic()，
@@ -2965,11 +2998,14 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   };
 
   const updateMemoryPalaceConfig = (updates: Partial<MemoryPalaceGlobalConfig>) => {
-    const newConfig: MemoryPalaceGlobalConfig = {
+    const newConfig = normalizeMemoryPalaceConfig({
+      ...memoryPalaceConfig,
+      ...updates,
       embedding: { ...memoryPalaceConfig.embedding, ...(updates.embedding || {}) },
       lightLLM: { ...memoryPalaceConfig.lightLLM, ...(updates.lightLLM || {}) },
       rerank: { ...memoryPalaceConfig.rerank, ...(updates.rerank || {}) },
-    };
+      featureFlags: { ...memoryPalaceConfig.featureFlags, ...(updates.featureFlags || {}) },
+    });
     setMemoryPalaceConfig(newConfig);
     localStorage.setItem('os_memory_palace_config', JSON.stringify(newConfig));
   };
@@ -3848,6 +3884,16 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   }
                   return Object.keys(map).length > 0 ? map : undefined;
               })() : undefined,
+              chatTranslateExpandedByChar: (mode === 'text_only' || mode === 'full') ? (() => {
+                  const map: Record<string, boolean> = {};
+                  for (let i = 0; i < localStorage.length; i++) {
+                      const key = localStorage.key(i);
+                      if (!key || !key.startsWith('chat_translate_expanded_')) continue;
+                      const charId = key.replace('chat_translate_expanded_', '');
+                      map[charId] = localStorage.getItem(key) === 'true';
+                  }
+                  return Object.keys(map).length > 0 ? map : undefined;
+              })() : undefined,
               chatTranslateSourceLangByChar: (mode === 'text_only' || mode === 'full') ? (() => {
                   const map: Record<string, string> = {};
                   for (let i = 0; i < localStorage.length; i++) {
@@ -4088,6 +4134,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 那边有 ensureFloat32 统一 Uint8Array / Float32Array / 遗留 number[] 三态），导出收尾交给
           // writeV2Backup 落进 zip——不进 backupData、不当普通数组分片，避开 number[] 进 JSON 的膨胀。
           let vectorPayload: ReturnType<typeof encodeVectorsForBackup> | undefined;
+          // Only voice Blobs reachable from the exported Live2D settings are portable.
+          // Orphaned/cancelled companion generations must not silently bloat a backup.
+          const companionVoiceAssetIdsForBackup = new Set<string>();
 
           for (const storeName of storesToProcess) {
               currentStep++;
@@ -4154,6 +4203,13 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               //    （media_only 的 roomItems/backgrounds 提取也依赖已还原成 data:）
               //  · cc_custom_parts：捏人器自定义部件的 src / shadowSrc
               //  · messages：视频通话每轮快照的 metadata.cameraSnapshotRef
+              if (storeName === 'characters' && mode !== 'text_only' && Array.isArray(rawData)) {
+                  // v1 陪伴语音存在 blob_assets（普通备份不读取该 store）。先迁移到
+                  // assets 的二进制语音通道，稍后 assets store 才能把完整 Blob 写进 ZIP。
+                  await ensureCompanionVoiceAssetsForBackup(rawData as CharacterProfile[]);
+                  collectCharacterCompanionVoiceAssetIds(rawData as CharacterProfile[])
+                      .forEach(assetId => companionVoiceAssetIdsForBackup.add(assetId));
+              }
               if ((storeName === 'characters' || storeName === 'cc_custom_parts' || storeName === 'messages') && mode !== 'text_only' && Array.isArray(rawData)) {
                   for (const c of rawData) await resolveBlobRefsDeep(c);
               }
@@ -4161,9 +4217,21 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               // --- MODE SPECIFIC FILTERING ---
 
               if (storeName === 'assets' && Array.isArray(rawData)) {
-                  rawData = rawData.filter((asset: { id?: string } | null | undefined) => {
+                  rawData = rawData.filter((asset: { id?: string; data?: { favorite?: boolean } } | null | undefined) => {
                       if (!asset || typeof asset.id !== 'string') return true;
-                      return !isRedundantManagedAssetId(asset.id);
+                      if (isRedundantManagedAssetId(asset.id)) return false;
+                      if (isCompanionVoiceAssetId(asset.id) && !companionVoiceAssetIdsForBackup.has(asset.id)) return false;
+                      // Shared TTS rows and un-favorited message voice are implementation
+                      // cache. Only explicit favorites and saved Live2D-preset dependencies
+                      // join full/media backups; neither joins text-only backups.
+                      return shouldIncludeVoiceRelatedAssetInBackup(asset, mode !== 'text_only');
+                  });
+                  // Blob is not JSON-serializable (`JSON.stringify(new Blob()) === '{}'`).
+                  // Put allowed audio bytes in their own ZIP entries and leave a JSON-safe
+                  // marker in the assets row. `tts_*` and ordinary un-favorited speech stay
+                  // disposable cache and are not duplicated in backups.
+                  await externalizeVoiceMessageBlobs(rawData, (path, bytes) => {
+                      zip.file(path, bytes, { compression: 'STORE' });
                   });
               }
 
@@ -4197,6 +4265,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                               charId: c.id,
                               avatar: c.avatar,
                               companionAvatar: c.companionAvatar,
+                              companionTouchSettings: c.companionTouchSettings,
                               sprites: c.sprites,
                               // Date app sprite data: skin sets carry alternate sprite maps,
                               // and customDateSprites/activeSkinSetId are required to wire them up.
@@ -4492,6 +4561,16 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 备份一旦命中特征就整包拒绝，不能出现“导入了一半才报错”的状态。
           assertSupportedSullyBackup(data);
 
+          // v2 backups keep favorite voice bytes outside JSON. Rehydrate every marker
+          // before DB.importFullData starts, so a missing/truncated file aborts while
+          // the current database is still untouched.
+          if (zip && Array.isArray(data.assets)) {
+              await restoreVoiceMessageBlobs(data.assets, async path => {
+                  const entry = zip?.file(path);
+                  return entry ? entry.async('uint8array') : null;
+              });
+          }
+
           const hadAssetStoreBackup = data.assets !== undefined;
           const hadCustomIconsBackup = data.customIcons !== undefined;
           const hadAppearancePresetsBackup = data.appearancePresets !== undefined;
@@ -4685,6 +4764,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           if (data.chatTranslateEnabledByChar && typeof data.chatTranslateEnabledByChar === 'object') {
               for (const [charId, enabled] of Object.entries(data.chatTranslateEnabledByChar)) {
                   localStorage.setItem(`chat_translate_enabled_${charId}`, enabled ? 'true' : 'false');
+              }
+          }
+          if (data.chatTranslateExpandedByChar && typeof data.chatTranslateExpandedByChar === 'object') {
+              for (const [charId, expanded] of Object.entries(data.chatTranslateExpandedByChar)) {
+                  localStorage.setItem(`chat_translate_expanded_${charId}`, expanded ? 'true' : 'false');
               }
           }
           if (data.chatTranslateSourceLangByChar && typeof data.chatTranslateSourceLangByChar === 'object') {
