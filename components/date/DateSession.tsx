@@ -6,17 +6,23 @@ import { DB } from '../../utils/db';
 import DateSettings from './DateSettings';
 import ObserveHUD from './ObserveHUD';
 import { extractObservation, hasObservation } from '../../utils/datePrompts';
-import { isBlobRef } from '../../utils/blobRef';
+import { useBlobRefUrl } from '../../utils/blobRef';
+import TokenImg from '../os/TokenImg';
 import { clearDateResumeAttempt } from '../../utils/dateSessionRecovery';
-import { cleanTextForTts, VALID_EMOTIONS } from '../../utils/minimaxTts';
-import { synthesizeSpeech, characterHasVoice } from '../../utils/ttsRouter';
-import { resolveTtsProvider } from '../../utils/ttsProvider';
-import { cleanTextForTtsFish, stripFishMarkupForDisplay } from '../../utils/fishAudioTts';
+import { VALID_EMOTIONS } from '../../utils/minimaxTts';
+import {
+    canSynthesizeSpeech,
+    characterHasVoice,
+    cleanTextForTtsProvider,
+    stripTtsMarkupForDisplay,
+    synthesizeSpeech,
+} from '../../utils/ttsRouter';
 import { planNovelLoadMore } from '../../utils/dateSessionHistory';
 import { getPendingReplyText } from '../../utils/pendingReply';
 import { fetchBlobForShare } from '../../utils/shareExport';
 import VoiceFavoriteActionSheet from '../voice/VoiceFavoriteActionSheet';
 import { getVoiceFavorite, makeVoiceFavoriteId, removeVoiceFavorite, saveVoiceFavorite } from '../../utils/voiceFavorites';
+import { MEETING_CONTINUE_DISPLAY_TEXT } from '../../utils/meetingContinue';
 
 // 语音情绪标记 [v:xxx]：跟立绘情绪 [emotion] 分开的独立通道。立绘的 happy 是
 // 夸张的表情、语音的 happy 是音色情绪，两者强度/语义差异大，不能一概而论。
@@ -107,7 +113,7 @@ interface DateSessionProps {
     messages: Message[]; // The DB messages for history/novel mode
     peekStatus: string;  // Initial text from the Peek phase
     initialState?: DateState; // Resume state
-    onSendMessage: (text: string) => Promise<string>; // Returns AI content
+    onSendMessage: (text: string, kind?: 'continue') => Promise<string>; // Returns AI content
     onReroll: () => Promise<string>;
     onExit: (currentState: DateState) => void;
     onEditMessage: (msg: Message) => void;
@@ -143,7 +149,8 @@ const ReadingAvatar: React.FC<{ src?: string; name: string; light: boolean }> = 
     const [imageFailed, setImageFailed] = useState(false);
     useEffect(() => setImageFailed(false), [src]);
 
-    const canShowImage = !!src && !isBlobRef(src) && !imageFailed;
+    // TokenImg 会把 blobref 令牌解析成可用 url，这里只判「有没有头像」和「加载失败没」
+    const canShowImage = !!src && !imageFailed;
     return (
         <div
             className={`mt-1 h-9 w-9 shrink-0 overflow-hidden rounded-full ring-1 shadow-sm ${
@@ -152,8 +159,8 @@ const ReadingAvatar: React.FC<{ src?: string; name: string; light: boolean }> = 
             aria-hidden="true"
         >
             {canShowImage ? (
-                <img
-                    src={src}
+                <TokenImg
+                    value={src}
                     alt=""
                     className="h-full w-full object-cover"
                     loading="lazy"
@@ -192,6 +199,8 @@ const DateSession: React.FC<DateSessionProps> = ({
     // Core VN State
     const [isNovelMode, setIsNovelMode] = useState(false);
     const [bgImage, setBgImage] = useState<string>(char.dateBackground || '');
+    // bgImage state 里存的一直是原始字段值（令牌 / data: / 外链），只在渲染这一刻解析成能喂 CSS 的 url
+    const bgImageUrl = useBlobRefUrl(bgImage);
     const [currentSprite, setCurrentSprite] = useState<string>('');
     const [currentSpriteKey, setCurrentSpriteKey] = useState<string>('');
     const [spriteConfig, setSpriteConfig] = useState(char.spriteConfig || { scale: 1, x: 0, y: 0 });
@@ -260,10 +269,9 @@ const DateSession: React.FC<DateSessionProps> = ({
     const VOICE_LANG_OPTIONS = [{v:'',l:'默认'},{v:'en',l:'EN'},{v:'ja',l:'JP'},{v:'ko',l:'KR'},{v:'fr',l:'FR'},{v:'es',l:'ES'}];
 
     const translateAndSpeak = async (text: string, emotion?: string): Promise<DateSpeechResult | null> => {
-        if (!characterHasVoice(char, apiConfig)) return null;
+        if (!canSynthesizeSpeech(char, apiConfig)) return null;
         try {
-            // 鱼声保留 inline cue，用 Fish 专属清洗；MiniMax 走原来的清洗。
-            let ttsText = resolveTtsProvider(apiConfig) === 'fishaudio' ? cleanTextForTtsFish(text) : cleanTextForTts(text);
+            let ttsText = cleanTextForTtsProvider(text, apiConfig);
             if (!ttsText || ttsText.length < 2) return null;
             if (voiceLang) {
                 const langLabel = VOICE_LANG_LABELS[voiceLang] || voiceLang;
@@ -289,9 +297,7 @@ const DateSession: React.FC<DateSessionProps> = ({
             });
             return {
                 url,
-                spokenText: resolveTtsProvider(apiConfig) === 'fishaudio'
-                    ? stripFishMarkupForDisplay(ttsText)
-                    : ttsText,
+                spokenText: stripTtsMarkupForDisplay(ttsText, apiConfig),
             };
         } catch (err: any) {
             console.warn('Date TTS failed:', err?.message);
@@ -527,11 +533,14 @@ const DateSession: React.FC<DateSessionProps> = ({
     const activeSprites = React.useMemo(() => getSpritesForSkin(), [char.activeSkinSetId, char.dateSkinSets, char.sprites]);
 
     const pickFallbackSprite = (sprites: Record<string, string>) => {
-        const key = ['normal', 'default', ...dateEmotionKeys].find(k => sprites[k] && !isBlobRef(sprites[k]));
-        const stray = Object.entries(sprites).find(([k, v]) => k !== 'chibi' && v && !isBlobRef(v));
+        const key = ['normal', 'default', ...dateEmotionKeys].find(k => sprites[k]);
+        const stray = Object.entries(sprites).find(([k, v]) => k !== 'chibi' && v);
         return { key: key || stray?.[0] || '', src: (key && sprites[key]) || stray?.[1] || char.avatar || '' };
     };
 
+    // 拿立绘的「字段值」反查它是哪个情绪键，靠的是跟 sprites 表里的值逐字相等。
+    // 所以 currentSprite state 里必须一直是原始字段值（blobref 令牌 / data: / 外链），
+    // 解析成 objectURL 只能发生在渲染那一刻（交给 TokenImg），否则这里永远查不到键。
     const inferSpriteKey = (src?: string, skinId?: string): string => {
         if (!src) return '';
         const sprites = getSpritesForSkin(skinId);
@@ -540,7 +549,7 @@ const DateSession: React.FC<DateSessionProps> = ({
 
     const resolveSpriteByKey = (key?: string, skinId?: string) => {
         const sprites = getSpritesForSkin(skinId);
-        if (key && sprites[key] && !isBlobRef(sprites[key])) return { key, src: sprites[key] };
+        if (key && sprites[key]) return { key, src: sprites[key] };
         return pickFallbackSprite(sprites);
     };
 
@@ -550,10 +559,7 @@ const DateSession: React.FC<DateSessionProps> = ({
         const legacyKey = inferSpriteKey(state.currentSprite, state.activeSkinSetId) || inferSpriteKey(state.currentSprite);
         if (legacyKey) return resolveSpriteByKey(legacyKey, state.activeSkinSetId);
         const fallback = resolveSpriteByKey(undefined, state.activeSkinSetId);
-        const legacySprite = state.currentSprite && !isBlobRef(state.currentSprite)
-            ? state.currentSprite
-            : fallback.src;
-        return { key: fallback.key, src: legacySprite };
+        return { key: fallback.key, src: state.currentSprite || fallback.src };
     };
 
     // Filter messages for Novel Mode: Show only current session
@@ -582,7 +588,7 @@ const DateSession: React.FC<DateSessionProps> = ({
             // Resume: 新快照只保存 sprite key，不再复制 base64；旧快照的 bg/currentSprite 仍兼容读取一次。
             const restoredSprite = resolveSpriteFromState(initialState);
             setBgImage(char.dateBackground || initialState.bgImage || '');
-            setCurrentSprite(isBlobRef(restoredSprite.src) ? (char.avatar || '') : restoredSprite.src);
+            setCurrentSprite(restoredSprite.src);
             setCurrentSpriteKey(restoredSprite.key);
             setCurrentText(initialState.currentText || '');
             setDisplayedText(initialState.currentText || '');
@@ -735,14 +741,14 @@ const DateSession: React.FC<DateSessionProps> = ({
         }
     };
 
-    const handleSend = async () => {
+    const submitTurn = async (kind?: 'continue') => {
         if (isTyping) return;
         const inputText = input.trim();
         // 本地失败输入优先，DB 时间线兜底。这样即使父组件刷新尚未落到这一帧，重试键也不会失效。
         const retryText = pendingRetryText || getPendingReplyText(messages);
-        if (!inputText && !retryText) return;
-        const text = inputText || retryText;
-        if (inputText) {
+        if (kind !== 'continue' && !inputText && !retryText) return;
+        const text = kind === 'continue' ? MEETING_CONTINUE_DISPLAY_TEXT : (inputText || retryText);
+        if (kind !== 'continue' && inputText) {
             setInput('');
             setShowInputBox(false);
         }
@@ -750,7 +756,7 @@ const DateSession: React.FC<DateSessionProps> = ({
         setIsShowingOpening(false); // First user interaction - opening phase is over
 
         try {
-            const aiContent = await onSendMessage(text);
+            const aiContent = await onSendMessage(text, kind);
             // 先剥出观测块更新 HUD，再解析剩余正文
             const { observation: obs, rest } = extractObservation(aiContent, { lenient: observeEnabled, custom: char.dateObserve?.custom });
             if (hasObservation(obs)) setObservation(obs);
@@ -770,6 +776,9 @@ const DateSession: React.FC<DateSessionProps> = ({
             setIsTyping(false);
         }
     };
+
+    const handleSend = () => { void submitTurn(); };
+    const handleContinue = () => { void submitTurn('continue'); };
 
     const handleRerollClick = async () => {
         if (isTyping) return;
@@ -930,12 +939,21 @@ const DateSession: React.FC<DateSessionProps> = ({
             {/* Background Layer */}
             <div 
                 className={`absolute inset-0 bg-cover bg-center transition-all duration-1000 ${isNovelMode ? 'blur-xl opacity-30' : 'opacity-80'}`} 
-                style={{ backgroundImage: bgImage ? `url(${bgImage})` : 'none' }}
+                style={{ backgroundImage: bgImageUrl ? `url(${bgImageUrl})` : 'none' }}
             ></div>
 
             {/* Menu Layer — 常驻只留「输入」+「菜单」两钮，其余操作收进带文字标签的下拉菜单 */}
             <div className="absolute top-0 right-0 p-4 pt-12 z-[100] flex flex-col items-end gap-2 pointer-events-auto">
                 <div className="flex gap-3">
+                    <button
+                        onClick={(e) => { e.stopPropagation(); setShowMenu(false); setShowVoiceLangPicker(false); handleContinue(); }}
+                        disabled={isTyping}
+                        className="w-10 h-10 shrink-0 rounded-full flex items-center justify-center border bg-black/30 backdrop-blur-md border-white/20 text-white shadow-lg active:scale-95 transition-all hover:bg-white/20 disabled:opacity-40"
+                        title={`本轮不主动行动，让${char.name}继续陪伴并推进见面`}
+                        aria-label="继续当前见面"
+                    >
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-3.5 h-3.5"><path fillRule="evenodd" d="M4.5 5.653c0-1.427 1.529-2.33 2.779-1.643l11.54 6.347c1.295.712 1.295 2.573 0 3.286L7.28 19.99c-1.25.687-2.779-.217-2.779-1.643V5.653Z" clipRule="evenodd" /></svg>
+                    </button>
                     <button onClick={(e) => { e.stopPropagation(); setShowInputBox(!showInputBox); setShowMenu(false); setShowVoiceLangPicker(false); }} className={`w-10 h-10 rounded-full flex items-center justify-center border transition-all shadow-lg active:scale-95 ${showInputBox ? 'bg-primary border-primary text-white' : 'bg-black/30 backdrop-blur-md border-white/20 text-white hover:bg-white/20'}`}>
                         <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-5 h-5"><path strokeLinecap="round" strokeLinejoin="round" d="M7.5 8.25h9m-9 3H12m-9.75 1.51c0 1.6 1.123 2.994 2.707 3.227 1.129.166 2.27.293 3.423.379.35.026.67.21.865.501L12 21l2.755-4.133a1.14 1.14 0 0 1 .865-.501 48.172 48.172 0 0 0 3.423-.379c1.584-.233 2.707-1.626 2.707-3.228V6.741c0-1.602-1.123-2.995-2.707-3.228A48.394 48.394 0 0 0 12 3c-2.392 0-4.744.175-7.043.513C3.373 3.746 2.25 5.14 2.25 6.741v6.018Z" /></svg>
                     </button>
@@ -1223,7 +1241,7 @@ const DateSession: React.FC<DateSessionProps> = ({
             {!isNovelMode && (
                 <>
                     <div className="absolute inset-x-0 bottom-0 h-[90%] flex items-end justify-center pointer-events-none z-10 overflow-hidden">
-                        {currentSprite && <img src={currentSprite} className="max-h-full max-w-full object-contain drop-shadow-[0_10px_20px_rgba(0,0,0,0.5)] transition-all duration-300 origin-bottom" style={{ filter: showInputBox ? 'brightness(1)' : (isTextAnimating ? 'brightness(1.05)' : 'brightness(1)'), transform: `translate(${spriteConfig.x}%, ${spriteConfig.y}%) scale(${isTextAnimating ? spriteConfig.scale * 1.02 : spriteConfig.scale})` }} />}
+                        {currentSprite && <TokenImg value={currentSprite} className="max-h-full max-w-full object-contain drop-shadow-[0_10px_20px_rgba(0,0,0,0.5)] transition-all duration-300 origin-bottom" style={{ filter: showInputBox ? 'brightness(1)' : (isTextAnimating ? 'brightness(1.05)' : 'brightness(1)'), transform: `translate(${spriteConfig.x}%, ${spriteConfig.y}%) scale(${isTextAnimating ? spriteConfig.scale * 1.02 : spriteConfig.scale})` }} />}
                     </div>
                     {!isTyping && (
                         <div className="absolute inset-x-0 bottom-8 z-30 flex justify-center">

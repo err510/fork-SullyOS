@@ -16,9 +16,9 @@ import { DB } from '../utils/db';
 import { ContextBuilder } from '../utils/context';
 import { safeResponseJson } from '../utils/safeApi';
 import { AppID, CharacterProfile, SpecialMomentRecord } from '../types';
-import { Capacitor } from '@capacitor/core';
-import { Filesystem, Directory } from '@capacitor/filesystem';
-import { Share } from '@capacitor/share';
+import { shareOrDownloadBlob } from '../utils/shareExport';
+import TokenImg from './os/TokenImg';
+import { isImageValue } from '../utils/blobRef';
 import { WhiteDaySession, isWhiteDayEventAvailable, WHITEDAY_RECORD_KEY } from './WhiteDayEvent';
 import { Like520Session, isLike520EventAvailable, isLike520Past, LIKE520_RECORD_KEY } from './Like520Event';
 import {
@@ -162,7 +162,7 @@ const getSpriteForEmotion = (emotion: string, char?: CharacterProfile): { type: 
         const mapped = valentineMap[emotion] || 'normal';
         const spriteUrl = VALENTINE_SPRITES[mapped];
         // 当占位emoji被替换为URL后，这里会自动识别为 image 类型
-        if (spriteUrl && (spriteUrl.startsWith('http') || spriteUrl.startsWith('data:'))) {
+        if (isImageValue(spriteUrl)) {
             return { type: 'image', value: spriteUrl };
         }
         return { type: 'emoji', value: spriteUrl || VALENTINE_SPRITES['normal'] };
@@ -681,27 +681,11 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
             });
             const fileName = `valentine_${char?.name || 'record'}_2026.png`;
 
-            if (Capacitor.isNativePlatform()) {
-                const dataUrl = canvas.toDataURL('image/png');
-                await Filesystem.writeFile({
-                    path: fileName,
-                    data: dataUrl,
-                    directory: Directory.Cache,
-                });
-                const uriResult = await Filesystem.getUri({
-                    directory: Directory.Cache,
-                    path: fileName,
-                });
-                await Share.share({
-                    title: '特别时光 - 导出长图',
-                    files: [uriResult.uri],
-                });
-            } else {
-                const link = document.createElement('a');
-                link.download = fileName;
-                link.href = canvas.toDataURL('image/png');
-                link.click();
-            }
+            const blob = await new Promise<Blob>((resolve, reject) => {
+                canvas.toBlob(result => result ? resolve(result) : reject(new Error('长图生成失败')), 'image/png');
+            });
+            const result = await shareOrDownloadBlob({ blob, fileName, shareTitle: '特别时光 - 导出长图' });
+            if (result === 'cancelled') return;
             addToast('导出成功', 'success');
         } catch (e: any) {
             console.error('Export failed:', e);
@@ -745,7 +729,7 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
                                     onContextMenu={(e) => { e.preventDefault(); setDeleteTargetId(c.id); }}
                                     className="bg-white rounded-2xl p-4 shadow-sm border border-pink-100 active:scale-95 transition-transform flex flex-col items-center gap-3 hover:shadow-md hover:border-pink-200 relative"
                                 >
-                                    <img src={c.avatar} className="w-16 h-16 rounded-full object-cover shadow-sm border-2 border-pink-100" alt={c.name} />
+                                    <TokenImg value={c.avatar} className="w-16 h-16 rounded-full object-cover shadow-sm border-2 border-pink-100" alt={c.name} />
                                     <span className="font-bold text-slate-700 text-sm">{c.name}</span>
                                     {hasRecord && <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-pink-400" />}
                                 </button>
@@ -796,7 +780,7 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
                 <div className="flex flex-col items-center gap-6">
                     <div className="relative">
                         <div className="w-20 h-20 rounded-full border-2 border-pink-500/20 flex items-center justify-center">
-                            {char && <img src={char.avatar} className="w-16 h-16 rounded-full object-cover" alt="" />}
+                            {char && <TokenImg value={char.avatar} className="w-16 h-16 rounded-full object-cover" alt="" />}
                         </div>
                         <div className="absolute inset-0 w-20 h-20 rounded-full border-2 border-transparent border-t-pink-400 animate-spin" />
                     </div>
@@ -964,8 +948,8 @@ export const ValentineSession: React.FC<ValentineSessionProps> = ({ charId, onCl
             {/* 立绘区域 - 高度填满设备，等比缩放，多余宽度裁掉 */}
             <div className="absolute inset-0 overflow-hidden flex items-end justify-center z-10 pointer-events-none">
                 {spriteInfo.type === 'image' ? (
-                    <img
-                        src={spriteInfo.value}
+                    <TokenImg
+                        value={spriteInfo.value}
                         className="h-full w-auto max-w-none drop-shadow-[0_10px_30px_rgba(236,72,153,0.3)] transition-all duration-500"
                         style={{
                             transform: `scale(${localSpriteScale}) translate(${localSpriteX}%, ${localSpriteY}%)`,
@@ -1272,8 +1256,8 @@ const SpecialEventCardImpl: React.FC<EventCardProps> = ({
                                             onContextMenu={(e) => { e.preventDefault(); if (hasRecord) onLongPressDelete(c.id); }}
                                             className={`flex flex-col items-center gap-2 p-3 bg-white/15 rounded-2xl border ${isPending ? 'border-white/80 ring-2 ring-white/60' : 'border-white/20'} active:scale-95 transition-transform relative`}
                                         >
-                                            {c.avatar?.startsWith('http') || c.avatar?.startsWith('data:') ? (
-                                                <img src={c.avatar} loading="lazy" decoding="async" alt="" className={`w-12 h-12 rounded-full object-cover border-2 ${theme.avatarRing}`} />
+                                            {isImageValue(c.avatar) ? (
+                                                <TokenImg value={c.avatar} loading="lazy" decoding="async" alt="" className={`w-12 h-12 rounded-full object-cover border-2 ${theme.avatarRing}`} />
                                             ) : (
                                                 <span className={`w-12 h-12 rounded-full flex items-center justify-center text-2xl bg-white/10 border-2 ${theme.avatarRing}`}>{c.avatar || '🌸'}</span>
                                             )}

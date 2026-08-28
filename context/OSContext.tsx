@@ -4,8 +4,10 @@ import { APIConfig, AppID, OSTheme, VirtualTime, CharacterProfile, CharacterGrou
 import { DB } from '../utils/db';
 import type { AvatarTouchRecord } from '../utils/avatarTouch';
 import { clampClaudeTemperature, modelRejectsSamplingParams, stripSamplingParams } from '../utils/samplingParamCompat';
-import { extractImagesInPlace, deepCloneForExport } from '../utils/backupExport';
-import { isBlobRef, getBlobForRef, migrateDataUrlToRef, migrateAppearancePresetBlobRefs, resolveBlobRefsDeep, BLOBREF_PREFIX, deleteBlobRefIfUnreferenced } from '../utils/blobRef';
+import { buildMalformedImageDiagnostics, extractImagesInPlace, deepCloneForExport, parseImageDataUrlForBackup, type BackupObjectPath, type MalformedBackupImageDiagnostic } from '../utils/backupExport';
+import { isBlobRef, getBlobForRef, restoreBlobRef, migrateDataUrlToRef, migrateAppearancePresetBlobRefs, migrateChatThemeBlobRefs, resolveBlobRefsDeep, resolveRefToDataUrl, BLOBREF_PREFIX, deleteBlobRefIfUnreferenced } from '../utils/blobRef';
+import { resolveBlobRefsInRequestBody } from '../utils/apiBlobRefs';
+import { collectBlobRefs, writeBlobsToZip, readBlobsIndex, restoreBlobsFromZip } from '../utils/backupBlobs';
 import { initPwaIcon, clearPwaIcon } from '../utils/appIcon';
 import { LEGACY_DEFAULT_WALLPAPER, isLegacyDefaultWallpaper, shouldPreserveLegacyDefaultWallpaper } from '../utils/wallpaperCompat';
 import { migrateSharkpanAssets } from '../utils/sharkpanAssetMigration';
@@ -35,6 +37,7 @@ import { INSTALLED_APPS, HIDDEN_APP_NAMES } from '../constants';
 import { isAnalyticsRequestUrl, trackEvent, trackDataScaleOnce, trackCurrentAppearanceOnce, trackCurrentCharSettingsOnce, trackCurrentFeaturesOnce } from '../utils/analytics';
 import { collectAppearance, collectCharSettings, collectDataScale, collectFeatureFlagsAsync } from '../utils/analyticsSnapshot';
 import { normalizeApiConfig, normalizeApiPreset } from '../utils/apiConfigNormalize';
+import { getCheckPhoneApi, setCheckPhoneApi } from '../utils/checkPhoneApi';
 import { markBackupDone } from '../utils/backupReminder';
 import { normalizeCharacterImpression, normalizeCharacterDefaults } from '../utils/impression';
 import { normalizeModelIds } from '../utils/modelList';
@@ -64,7 +67,7 @@ import { markAmsgStateDirty, markAmsgStateDirtyForAll, resumePendingAmsgStateSyn
 import { loadMusicPlaybackSnapshot } from './MusicContext';
 import { setCharNameRegistry } from '../utils/charNameRegistry';
 import { setMinimaxRegion } from '../utils/minimaxEndpoint';
-import { setTtsProvider, setVoicePromptOverrides } from '../utils/ttsProvider';
+import { setElevenLabsModel, setTtsProvider, setVoicePromptOverrides } from '../utils/ttsProvider';
 import { LocalNotifications } from '@capacitor/local-notifications';
 import { Capacitor } from '@capacitor/core';
 import { formatBytes } from '../utils/format';
@@ -528,6 +531,12 @@ const replaceWallpaperAssetPointer = async (assetId: 'wallpaper' | 'lock_wallpap
 };
 
 /**
+ * 桌面小组件的槽位。每个槽位在 assets 表里是一行 `widget_<slot>`，值是 blobref 令牌。
+ * 'bl' / 'br' 是已停用的老槽位，加载与写入时一律剥掉，不在这份清单里。
+ */
+const LAUNCHER_WIDGET_SLOTS = ['tl', 'tr', 'wide', 'dsq'] as const;
+
+/**
  * 把「存储值」壁纸解析成可直接渲染的 url，并把指针（令牌）落进 assets 'wallpaper'。
  *   · blobref 令牌 → 读 Blob 建 objectURL；
  *   · 旧 data: → 惰性迁移成 Blob 令牌（存量用户下次加载即享空间收益），返回 objectURL；
@@ -620,6 +629,14 @@ const defaultApiConfig: APIConfig = {
   minimaxApiKey: '',
   minimaxGroupId: '',
   minimaxRegion: 'domestic',
+  ttsProvider: 'minimax',
+  fishAudioModel: 's2.1-pro',
+  elevenLabsApiKey: '',
+  elevenLabsModel: 'eleven_flash_v2_5',
+  elevenLabsStability: 0.5,
+  elevenLabsSimilarityBoost: 0.8,
+  elevenLabsStyle: 0,
+  elevenLabsUseSpeakerBoost: false,
   model: 'gpt-4o-mini',
   stream: false,
   temperature: 0.85,
@@ -1126,6 +1143,15 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                       if (body !== rawBody) sendArgs = [resource, { ...(config as RequestInit), body }];
                   } catch { /* 非 JSON body：原样放行 */ }
               }
+
+              // 图片令牌不出门：`blobref:` 是本机存储形态，发出去对面只会看到一串读不懂的
+              // 字符，然后说「我没看到图片」——不报错也不破图，最难查（详见 utils/apiBlobRefs.ts）。
+              // safeFetchJson 那条路自己还原过一遍，这里兜的是绕开它直接用 fetch 的调用点。
+              const bodyBeforeRefs = (sendArgs[1] as RequestInit | undefined)?.body;
+              const bodyWithImages = await resolveBlobRefsInRequestBody(bodyBeforeRefs);
+              if (bodyWithImages !== bodyBeforeRefs) {
+                  sendArgs = [sendArgs[0], { ...(sendArgs[1] as RequestInit), body: bodyWithImages as BodyInit }];
+              }
           }
 
           // 用户手动开启的「本次发送统计」：只抢占下一条请求，并在真正发出前立即自动关闭。
@@ -1569,11 +1595,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   const needsBuiltinVideoAvatar = !existingSully.videoAvatar;
                   const needsBuiltinVideoAvatarUpgrade = isBuiltinSullyLive2D(existingSully.videoAvatar)
                       && existingSully.videoAvatar.builtinFramingVersion !== 2;
-                 // 之前误把家园 chibi 替换成了像素小屋的像素立绘 → 还原为原版 sharkpan 立绘
-                 const hasMisplacedPixelChibi = typeof currentSprites['chibi'] === 'string'
-                     && currentSprites['chibi'].startsWith('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAADUAAAA4CAYAAABdeLCu');
-
-                  if (isCorrupted || !existingSully.roomConfig || needsWallUpdate || needsSkinSets || hasMisplacedPixelChibi || needsAvatarUpdate || needsBuiltinVideoAvatar || needsBuiltinVideoAvatarUpgrade) {
+                  if (isCorrupted || !existingSully.roomConfig || needsWallUpdate || needsSkinSets || needsAvatarUpdate || needsBuiltinVideoAvatar || needsBuiltinVideoAvatarUpgrade) {
                      const restoredSprites = { ...sullyV2.sprites, ...currentSprites };
 
                      if (!restoredSprites['normal']) restoredSprites['normal'] = sullyV2.sprites!['normal'];
@@ -1582,7 +1604,6 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                      if (!restoredSprites['angry']) restoredSprites['angry'] = sullyV2.sprites!['angry'];
                      if (!restoredSprites['shy']) restoredSprites['shy'] = sullyV2.sprites!['shy'];
                      if (!restoredSprites['chibi']) restoredSprites['chibi'] = sullyV2.sprites!['chibi'];
-                     if (hasMisplacedPixelChibi) restoredSprites['chibi'] = sullyV2.sprites!['chibi'];
 
                      const updatedRoomConfig = existingSully.roomConfig ? {
                          ...existingSully.roomConfig,
@@ -1790,9 +1811,13 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                           // Web Notification
                           if (!Capacitor.isNativePlatform() && window.Notification && Notification.permission === 'granted') {
                               try {
+                                  // 通知不是 DOM，icon 只认能直接加载的地址：头像字段可能是 blobref
+                                  // 令牌，原样塞进去就是没图标。先解析（非令牌原样返回），解析不出
+                                  // 来（图已丢）时退回应用默认图标。
+                                  const icon = (await resolveRefToDataUrl(char.avatar || '')) || './icons/icon-192.png';
                                   const notif = new Notification(char.name, {
                                       body: dueMessages[0].content,
-                                      icon: char.avatar,
+                                      icon,
                                       silent: false
                                   });
                                   notif.onclick = () => {
@@ -1859,10 +1884,14 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               // 静默失败，必须走 SW registration 才稳定。
               if (!Capacitor.isNativePlatform() && 'serviceWorker' in navigator && window.Notification && Notification.permission === 'granted') {
                   const char = characters.find(c => c.id === charId);
-                  navigator.serviceWorker.ready.then(reg => {
+                  navigator.serviceWorker.ready.then(async reg => {
+                      // 同上：令牌是个非空字符串，`char?.avatar || 默认图标` 这种写法会让默认
+                      // 图标那条兜底永远轮不到，结果一个图标都没有还不报错。所以先解析成能
+                      // 加载的地址，拿到空串才用默认图标。
+                      const icon = (await resolveRefToDataUrl(char?.avatar || '')) || './icons/icon-192.png';
                       reg.showNotification(charName, {
                           body: preview,
-                          icon: char?.avatar || './icons/icon-192.png',
+                          icon,
                           badge: './icons/icon-192.png',
                           tag: `proactive-${charId}`,
                           data: { charId, kind: 'proactive-1.0' },
@@ -2047,6 +2076,16 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           addToast(text, 'error');
       };
 
+      // 上线补收时发现有消息超出了两天的补收窗口，只销账没能上屏。
+      // 这条路是开 App 就自动跑的，销完账本就干净了——用户之后去点「找回没收到的消息」
+      // 只会看到「账本上没有漏收的消息，这条链路是通的」，明明刚丢了东西。这一句是
+      // 那件事唯一说得出口的地方，所以按 error 弹、也不做节流。
+      const backfillStaleHandler = (e: Event) => {
+          const { count } = ((e as CustomEvent).detail || {}) as { count?: number };
+          if (!count) return;
+          addToast(`有 ${count} 条消息超过两天没能收到，已经拿不回来了`, 'error');
+      };
+
       // 记忆宫殿水位线触发的全局提示：聊天/见面/通话共用同一条消息流，
       // pipeline 真正开始整理时会广播此事件——无论用户此刻在哪个 App，
       // 都统一弹「xx正在整理记忆」。
@@ -2057,6 +2096,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
 
       window.addEventListener('active-msg-received', handler);
       window.addEventListener('active-msg-process-failed', inboxFailHandler);
+      window.addEventListener('active-msg-backfill-stale', backfillStaleHandler);
       window.addEventListener('active-msg-progress', progressHandler);
       window.addEventListener('active-msg-open', openHandler);
       window.addEventListener('emotion-updated', buffSyncHandler);
@@ -2068,6 +2108,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
       return () => {
           window.removeEventListener('active-msg-received', handler);
           window.removeEventListener('active-msg-process-failed', inboxFailHandler);
+          window.removeEventListener('active-msg-backfill-stale', backfillStaleHandler);
           window.removeEventListener('active-msg-progress', progressHandler);
           window.removeEventListener('active-msg-open', openHandler);
           window.removeEventListener('emotion-updated', buffSyncHandler);
@@ -2105,6 +2146,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
   useEffect(() => {
     setTtsProvider(apiConfig.ttsProvider);
   }, [apiConfig.ttsProvider]);
+  // ElevenLabs 的 v3 与 Flash/Multilingual 使用不同的提示词标记；prompt 构建器靠单例读当前模型。
+  useEffect(() => {
+    setElevenLabsModel(apiConfig.elevenLabsModel);
+  }, [apiConfig.elevenLabsModel]);
   // 同步用户自定义语音表演指南（同上：chatPrompts 拿不到 apiConfig，靠单例读最新值）。
   useEffect(() => {
     setVoicePromptOverrides(apiConfig.voicePrompts);
@@ -2828,13 +2873,15 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
     await DB.deleteAsset('launcherWidgetImage');
 
     // Save widget images to IndexedDB (each slot is a separate asset)
+    // 值是 blobref 令牌（写端见 apps/Appearance.tsx 的 handleWidgetUpload），一律原样落库。
+    // 别按 data: 前缀挑着存——令牌不带这个前缀，挑的结果是这张图只剩 localStorage 一份，
+    // 启动时 assets 那份是空的、界面上小组件直接没了。
     if (launcherWidgets !== undefined) {
-        const slots = ['tl', 'tr', 'wide', 'dsq'];
-        for (const slot of slots) {
+        for (const slot of LAUNCHER_WIDGET_SLOTS) {
             const val = sanitizedWidgets?.[slot];
-            if (val && val.startsWith('data:')) {
+            if (val) {
                 await DB.saveAsset(`widget_${slot}`, val);
-            } else if (!val) {
+            } else {
                 await DB.deleteAsset(`widget_${slot}`);
             }
         }
@@ -3463,6 +3510,24 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           delete w['br'];
           sanitizedPresetTheme.launcherWidgets = Object.keys(w).length > 0 ? w : undefined;
       }
+      // 小组件图落进 assets 的 widget_*：启动加载时这张表会盖掉 localStorage 里那份，
+      // 应用预设时不写它，下次启动看到的就还是上一套主题的小组件。
+      // 别人分享来的预设里可能还压着 base64，先转成令牌再落库（跟下面 customIcons 一个做法）。
+      {
+          const presetWidgets = (sanitizedPresetTheme.launcherWidgets || {}) as Record<string, string>;
+          const persistedWidgets: Record<string, string> = {};
+          for (const slot of LAUNCHER_WIDGET_SLOTS) {
+              const val = presetWidgets[slot];
+              if (val) {
+                  const stored = val.startsWith('data:') ? await migrateDataUrlToRef(val) : val;
+                  persistedWidgets[slot] = stored;
+                  await DB.saveAsset(`widget_${slot}`, stored);
+              } else {
+                  await DB.deleteAsset(`widget_${slot}`);
+              }
+          }
+          sanitizedPresetTheme.launcherWidgets = Object.keys(persistedWidgets).length > 0 ? persistedWidgets : undefined;
+      }
       // 壁纸改存 Blob：把预设里的指针（blobref 令牌 / 旧 data:）落库并解析成 objectURL 再进 state。
       if (sanitizedPresetTheme.wallpaper !== undefined && typeof sanitizedPresetTheme.wallpaper === 'string') {
           const legacyWallpaper = isLegacyDefaultWallpaper(sanitizedPresetTheme.wallpaper);
@@ -3519,13 +3584,20 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           setCustomIcons(persistedIcons);
       }
       // Apply chat themes if present
+      // 预设里的气泡主题可能还压着 base64（老预设、别人分享来的包）。原样写回 themes 表
+      // 等于把一键优化刚转走的图又倒回去——用户会看到「优化完过阵子又涨回来了」。
+      // 所以落库前先转成令牌，内存里也用转完的那份：不然下次存预设又把 base64 抄进去，
+      // 绕成一个圈。上面 customIcons 那段本来就是这么做的，这里跟它对齐。
       if (preset.chatThemes) {
+          const migratedThemes: ChatTheme[] = [];
           for (const ct of preset.chatThemes) {
-              await DB.saveTheme(ct);
+              const migrated = await migrateChatThemeBlobRefs(ct);
+              migratedThemes.push(migrated);
+              await DB.saveTheme(migrated);
           }
           setCustomThemes(prev => {
               const merged = [...prev];
-              for (const ct of preset.chatThemes!) {
+              for (const ct of migratedThemes) {
                   const idx = merged.findIndex(t => t.id === ct.id);
                   if (idx >= 0) merged[idx] = ct;
                   else merged.push(ct);
@@ -3665,12 +3737,24 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           const zip = new JSZip();
           const assetsFolder = zip.folder("assets");
           let assetCount = 0;
+          let malformedImageCount = 0;
+          const malformedImageDiagnostics: MalformedBackupImageDiagnostic[] = [];
+          const maxMalformedImageDiagnostics = 100;
 
           // Dedup table — same base64 payload reused across stores (角色头像在
           // 多个 chat / handbook / room 里被嵌入) gets stored exactly once. Key
           // is the base64 string itself, value is the assets/* path. For a
           // heavy user with 50 chats sharing a 200KB avatar this trims ~10MB.
           const assetDedupMap = new Map<string, string>();
+
+          // v3 blob 旁路：blobref 令牌原样进 JSON，这里从每段真正落包的 JSON 文本里收集
+          // 令牌（backupFormat 的 onSerialized 钩子），打包收尾把对应 Blob 直写 blobs/*。
+          // 从落包文本收集 = 没有「哪些 store 要处理」的名单可漏，嵌套 JSON 字符串里的
+          // 令牌（如 assets 表的 appearance_preset_*）也逐字可见。text_only 令牌已剥空，不收。
+          const referencedBlobTokens = new Set<string>();
+          const collectSerialized = mode === 'text_only'
+              ? undefined
+              : (s: string) => collectBlobRefs(s, referencedBlobTokens);
 
           // Strip Base64 Images (Recursive) - Used for Text Only Mode
           const stripBase64 = (obj: any): any => {
@@ -3715,19 +3799,33 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           };
 
           // 把一条 data:image base64 落进 ZIP 的 assets/ 文件夹，返回它的 assets/* 路径。
-          // 同一份 base64 全局只存一份（assetDedupMap 按完整 base64 去重）；无法识别的
-          // data url 原样返回，不动它。
-          const resolveImage = (value: string): string => {
+          // 同一份 base64 全局只存一份（assetDedupMap 按完整 base64 去重）。无法识别但
+          // 不一定损坏的 data url 原样保留；确认损坏的正文只在导出副本里置空。
+          const resolveImage = (value: string, location: string): string => {
               try {
                   const cached = assetDedupMap.get(value);
                   if (cached) return cached;
-                  const extMatch = value.match(/data:image\/([a-zA-Z0-9]+);base64,/);
-                  if (!extMatch) return value;
-                  const ext = extMatch[1] === 'jpeg' ? 'jpg' : extMatch[1];
-                  const filename = `asset_${Date.now()}_${assetCount++}.${ext}`;
-                  const base64Data = value.split(',')[1];
+                  const parsed = parseImageDataUrlForBackup(value);
+                  if (!parsed.ok) {
+                      // SVG、带额外 MIME 参数等本来就不走 assets/* 的 data URL 沿用旧行为，
+                      // 原样留在 JSON，也不把它误报成「损坏图片」。
+                      if (parsed.reason === 'unsupported-header') return value;
+                      malformedImageCount++;
+                      if (malformedImageDiagnostics.length < maxMalformedImageDiagnostics) {
+                          malformedImageDiagnostics.push({
+                              location,
+                              reason: parsed.reason,
+                              originalLength: value.length,
+                          });
+                      }
+                      // 坏 Base64 已无法还原；不把正文写进 assets 或备份 JSON，避免恢复后继续
+                      // 传播脏数据。这里只修改 IDB 结构化克隆/运行态深拷贝，不会改用户本地库。
+                      console.warn(`[Backup] 损坏图片已从导出副本跳过: ${location} (${parsed.reason}, ${value.length} chars)`);
+                      return '';
+                  }
+                  const filename = `asset_${Date.now()}_${assetCount++}.${parsed.extension}`;
                   // JPEG/PNG/WebP/GIF 本身已压缩，再跑 DEFLATE 只会浪费手机 CPU；直接存储。
-                  assetsFolder?.file(filename, base64Data, { base64: true, compression: 'STORE' });
+                  assetsFolder?.file(filename, parsed.base64, { base64: true, compression: 'STORE' });
                   const path = `assets/${filename}`;
                   assetDedupMap.set(value, path);
                   return path;
@@ -3741,8 +3839,32 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // 原地把 base64 换成 assets/* 路径，不再另建一棵对象树，导出大 store 时峰值内存更省。
           // 传进来的必须是独立副本：store 数据是 IDB 结构化克隆副本（安全）；theme /
           // customIcons / appearancePresets 引用了运行态 state，已在上面 backupData 里深拷贝。
-          const processObject = (obj: any): any => {
-              extractImagesInPlace(obj, resolveImage);
+          const processObject = (obj: any, source = 'backupData'): any => {
+              const safeRecordId = (value: unknown): string | null => {
+                  if (typeof value !== 'string' && typeof value !== 'number') return null;
+                  return String(value).replace(/[\r\n]/g, ' ').slice(0, 80);
+              };
+              const describeLocation = (path: BackupObjectPath): string => {
+                  let label = source;
+                  let pathStart = 0;
+                  if (Array.isArray(obj) && typeof path[0] === 'number') {
+                      const index = path[0];
+                      const row = obj[index];
+                      const id = row && typeof row === 'object'
+                          ? safeRecordId((row as any).id ?? (row as any).uuid ?? (row as any).key)
+                          : null;
+                      label += `[${index}]${id ? `(id=${id})` : ''}`;
+                      pathStart = 1;
+                  } else if (obj && typeof obj === 'object' && !source.includes('(id=')) {
+                      const id = safeRecordId((obj as any).id ?? (obj as any).uuid ?? (obj as any).key);
+                      if (id) label += `(id=${id})`;
+                  }
+                  for (const segment of path.slice(pathStart)) {
+                      label += typeof segment === 'number' ? `[${segment}]` : `.${segment}`;
+                  }
+                  return label;
+              };
+              extractImagesInPlace(obj, (dataUrl, path) => resolveImage(dataUrl, describeLocation(path)));
               return obj;
           };
 
@@ -3814,6 +3936,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               timestamp: Date.now(),
               version: 3,
               apiConfig: (mode === 'text_only' || mode === 'full') ? apiConfig : undefined,
+              checkPhoneApi: (mode === 'text_only' || mode === 'full') ? getCheckPhoneApi() : undefined,
               apiPresets: (mode === 'text_only' || mode === 'full') ? apiPresets : undefined,
               availableModels: (mode === 'text_only' || mode === 'full') ? availableModels : undefined,
               realtimeConfig: (mode === 'text_only' || mode === 'full') ? realtimeConfig : undefined,
@@ -3988,10 +4111,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           // Pre-process specialized image fields (Social App, Theme)。processObject 是
           // 原地改，所以这里按语句调用、不接返回值，读起来就是「就地处理这个对象」。
           if (mode !== 'text_only') {
-              // 壁纸 / 小屋自定义素材 / 外观预设里可能存的是 blobref 令牌（本机 blob_assets）。
-              // 先把令牌解析回 data:image，再交给下面 processObject 的 data:→zip 抽取管线，
-              // 备份格式与可移植性完全不变。theme.wallpaper 内存里是 blob: objectURL，
-              // resolveBlobRefsDeep 认不得 blob:，所以壁纸单独按令牌指针读 assets 还原。
+              // 壁纸 / 小屋自定义素材 / 外观预设里的 blobref 令牌原样进包（二进制走 blobs/*
+              // 旁路，onSerialized 收集，无需在这里逐字段处理）。theme.wallpaper 内存里是
+              // blob: objectURL（会话临时，恢复端认不得），这里换回持久化指针
+              // （blobref 令牌 / 旧 data: / http）。旧 data: 值仍走下面 processObject 的
+              // data:→assets/* 抽取管线。
               if (backupData.theme) {
                   const wp = (backupData.theme as any).wallpaper;
                   if (typeof wp === 'string' && wp.startsWith('blob:')) {
@@ -4003,18 +4127,14 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                       const ptr = await DB.getAsset('lock_wallpaper');
                       (backupData.theme as any).lockWallpaper = ptr || undefined;
                   }
-                  await resolveBlobRefsDeep(backupData.theme);
               }
-              if (backupData.roomCustomAssets) await resolveBlobRefsDeep(backupData.roomCustomAssets);
-              if (backupData.customIcons) await resolveBlobRefsDeep(backupData.customIcons);
-              if (backupData.appearancePresets) await resolveBlobRefsDeep(backupData.appearancePresets);
 
-              if (backupData.socialAppData?.userProfile) processObject(backupData.socialAppData.userProfile);
-              if (backupData.socialAppData?.userBg) processObject(backupData.socialAppData.userBg);
-              if (backupData.roomCustomAssets) processObject(backupData.roomCustomAssets);
-              if (backupData.theme) processObject(backupData.theme);
-              if (backupData.customIcons) processObject(backupData.customIcons);
-              if (backupData.appearancePresets) processObject(backupData.appearancePresets);
+              if (backupData.socialAppData?.userProfile) processObject(backupData.socialAppData.userProfile, 'socialAppData.userProfile');
+              if (backupData.socialAppData?.userBg) processObject(backupData.socialAppData.userBg, 'socialAppData.userBg');
+              if (backupData.roomCustomAssets) processObject(backupData.roomCustomAssets, 'roomCustomAssets');
+              if (backupData.theme) processObject(backupData.theme, 'theme');
+              if (backupData.customIcons) processObject(backupData.customIcons, 'customIcons');
+              if (backupData.appearancePresets) processObject(backupData.appearancePresets, 'appearancePresets');
           } else {
               // Strip images for text only
               if (backupData.socialAppData?.userProfile) backupData.socialAppData.userProfile = stripBase64(backupData.socialAppData.userProfile);
@@ -4055,11 +4175,11 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           ]);
 
           // Chunked processObject for large arrays — yields to main thread every 200 items
-          const processArrayChunked = async (arr: any[], fn: (item: any) => any, chunkSize = 200): Promise<any[]> => {
+          const processArrayChunked = async (arr: any[], fn: (item: any, index: number) => any, chunkSize = 200): Promise<any[]> => {
               if (arr.length <= chunkSize) return arr.map(fn);
               const result: any[] = [];
               for (let i = 0; i < arr.length; i += chunkSize) {
-                  const chunk = arr.slice(i, i + chunkSize).map(fn);
+                  const chunk = arr.slice(i, i + chunkSize).map((item, offset) => fn(item, i + offset));
                   result.push(...chunk);
                   if (i + chunkSize < arr.length) {
                       await new Promise(r => setTimeout(r, 0));
@@ -4203,21 +4323,16 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   continue;
               }
 
-              // 这些 store 的图片可能存的是 blobref 令牌，媒体/全量模式下先解析回 data:image，
-              // 令后面的 data:→zip 抽取能认得：
-              //  · characters：小屋 roomConfig.wallImage/floorImage/items[].image、sprites.chibi
-              //    （media_only 的 roomItems/backgrounds 提取也依赖已还原成 data:）
-              //  · cc_custom_parts：捏人器自定义部件的 src / shadowSrc
-              //  · messages：视频通话每轮快照的 metadata.cameraSnapshotRef
+              // blobref 令牌（characters 的小屋图 / sprites.chibi、cc_custom_parts 的
+              // src/shadowSrc、messages 的 cameraSnapshotRef、songs 的 coverImage……）
+              // 不在这里做任何处理：v3 令牌原样进 JSON，onSerialized 统一收集、
+              // 二进制随 blobs/* 旁路走，任何 store 的令牌都覆盖，没有名单可漏。
               if (storeName === 'characters' && mode !== 'text_only' && Array.isArray(rawData)) {
                   // v1 陪伴语音存在 blob_assets（普通备份不读取该 store）。先迁移到
                   // assets 的二进制语音通道，稍后 assets store 才能把完整 Blob 写进 ZIP。
                   await ensureCompanionVoiceAssetsForBackup(rawData as CharacterProfile[]);
                   collectCharacterCompanionVoiceAssetIds(rawData as CharacterProfile[])
                       .forEach(assetId => companionVoiceAssetIdsForBackup.add(assetId));
-              }
-              if ((storeName === 'characters' || storeName === 'cc_custom_parts' || storeName === 'messages') && mode !== 'text_only' && Array.isArray(rawData)) {
-                  for (const c of rawData) await resolveBlobRefsDeep(c);
               }
 
               // --- MODE SPECIFIC FILTERING ---
@@ -4266,7 +4381,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   if (storeName === 'characters' && mode === 'media_only') {
                       // Character Logic: Export ONLY visual assets to mediaAssets array
                       // Do not export the full character array to avoid overwriting text data on import
-                      const mediaList = rawData.map((c: CharacterProfile) => {
+                      const mediaList = rawData.map((c: CharacterProfile, index: number) => {
                           const extracted = {
                               charId: c.id,
                               avatar: c.avatar,
@@ -4280,7 +4395,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                               customDateSprites: c.customDateSprites,
                               spriteConfig: c.spriteConfig,
                               roomItems: c.roomConfig?.items?.reduce((acc: any, item: any) => {
-                                  if (item.image && item.image.startsWith('data:')) {
+                                  // data:（旧值，下面 processObject 抽成 assets/*）和 blobref
+                                  // 令牌（v3 原样进包，二进制走 blobs/*）都算媒体，都带走。
+                                  if (item.image && (item.image.startsWith('data:') || isBlobRef(item.image))) {
                                       acc[item.id] = item.image;
                                   }
                                   return acc;
@@ -4292,15 +4409,20 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                                   roomFloor: c.roomConfig?.floorImage
                               }
                           };
-                          return processObject(extracted);
+                          return processObject(extracted, `characters[${index}](id=${String(c.id).slice(0, 80)})`);
                       });
                       backupData.mediaAssets = mediaList;
                       continue; // Skip standard assignment
                   }
 
                   processedData = Array.isArray(rawData) && rawData.length > 200
-                      ? await processArrayChunked(rawData, processObject)
-                      : processObject(rawData);
+                      ? await processArrayChunked(rawData, (item, index) => {
+                          const id = item && typeof item === 'object'
+                              ? String(item.id ?? item.uuid ?? item.key ?? '').replace(/[\r\n]/g, ' ').slice(0, 80)
+                              : '';
+                          return processObject(item, `${storeName}[${index}]${id ? `(id=${id})` : ''}`);
+                      })
+                      : processObject(rawData, storeName);
               }
 
               // Assign to Backup Data
@@ -4406,8 +4528,37 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   vectors: vectorPayload,
                   prewrittenStores,
                   onYield: () => new Promise<void>(r => setTimeout(r, 0)),
+                  onSerialized: collectSerialized,
               },
           );
+
+          // v3 blob 旁路收尾：被引用令牌的 Blob 直写 blobs/<id>（原文件字节，全程不经
+          // base64），附 blobs/index.json。图已丢的令牌跳过——死令牌留在 JSON 里，
+          // 恢复端渲染为空，与 v2 置空串的用户可见结果等价。
+          if (collectSerialized && referencedBlobTokens.size > 0) {
+              setSysOperation({ status: 'processing', message: '正在打包图片二进制...', progress: 70 });
+              const { missing } = await writeBlobsToZip(
+                  zip as unknown as ZipFileWriter,
+                  referencedBlobTokens,
+                  getBlobForRef,
+                  { onYield: () => new Promise<void>(r => setTimeout(r, 0)) },
+              );
+              if (missing.length > 0) {
+                  console.warn(`备份时 ${missing.length} 个图片令牌已无对应数据，已跳过:`, missing);
+              }
+          }
+
+          if (malformedImageCount > 0) {
+              zip.file(
+                  'diagnostics/malformed-images.json',
+                  JSON.stringify(buildMalformedImageDiagnostics({
+                      createdAt: new Date().toISOString(),
+                      mode,
+                      total: malformedImageCount,
+                      items: malformedImageDiagnostics,
+                  }), null, 2),
+              );
+          }
 
           // 进度提示：每 ~5% 更新一次（避免高频 React 重渲染），同时让进度
           // 条从 70% 平滑爬到 99%，用户能确切看到"在动"。
@@ -4436,6 +4587,10 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
           setSysOperation({ status: 'idle', message: '', progress: 100 });
           // 备份成功 → 推进「该备份啦」提醒的计时（本地导出 / 云备份都走这里，一处覆盖两条路径）
           markBackupDone();
+          if (malformedImageCount > 0) {
+              console.warn(`[Backup] 备份已完成，已从导出副本跳过 ${malformedImageCount} 处损坏图片`, malformedImageDiagnostics);
+              addToast(`备份已生成，已跳过 ${malformedImageCount} 处无法恢复的损坏图片；其他数据已正常保存`, 'info');
+          }
           return content;
 
       } catch (e: any) {
@@ -4577,6 +4732,29 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               });
           }
 
+          // v3 blob 旁路：令牌原样在 JSON 里，二进制在 blobs/*。readBlobsIndex 先把索引
+          // 与文件齐全性验完（此时一个字节没写），再按原令牌 id 写回 blob_assets——令牌
+          // 身份保住，JSON 引用零改写、零重编码。中途失败直接中止导入：主数据尚未写库，
+          // 已写回的部分只是孤儿 blob，由手动 GC 收口。v2 老包没有索引文件，这里是 no-op。
+          if (zip) {
+              const blobEntries = await readBlobsIndex(zip as unknown as ZipFileReader);
+              if (blobEntries.length > 0) {
+                  await restoreBlobsFromZip(
+                      zip as unknown as ZipFileReader,
+                      blobEntries,
+                      restoreBlobRef,
+                      {
+                          onYield: () => new Promise<void>(r => setTimeout(r, 0)),
+                          onProgress: (done, total, id) => {
+                              showImportProgress('assets', '正在恢复图片二进制...',
+                                  30 + Math.floor((done / Math.max(1, total)) * 5),
+                                  { current: `图片二进制 ${done}/${total}`, currentFile: id });
+                          },
+                      },
+                  );
+              }
+          }
+
           const hadAssetStoreBackup = data.assets !== undefined;
           const hadCustomIconsBackup = data.customIcons !== undefined;
           const hadAppearancePresetsBackup = data.appearancePresets !== undefined;
@@ -4692,6 +4870,7 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
               await updateTheme(data.theme);
           }
           if (data.apiConfig) updateApiConfig(data.apiConfig);
+          if (data.checkPhoneApi !== undefined) setCheckPhoneApi(data.checkPhoneApi ?? null);
           if (data.availableModels) saveModels(data.availableModels);
           if (data.apiPresets) savePresets(data.apiPresets);
           if (data.realtimeConfig) updateRealtimeConfig(data.realtimeConfig); // 恢复实时感知配置
@@ -4718,10 +4897,9 @@ export const OSProvider: React.FC<{ children: React.ReactNode }> = ({ children }
                   }
               }
               if (data.appearancePresets) {
-                  const cache = new Map<string, string>();
                   const migratedPresets: AppearancePreset[] = [];
                   for (const preset of data.appearancePresets) {
-                      const migrated = await migrateAppearancePresetBlobRefs(preset, cache);
+                      const migrated = await migrateAppearancePresetBlobRefs(preset);
                       migratedPresets.push(migrated);
                       await DB.saveAsset(`appearance_preset_${migrated.id}`, JSON.stringify(migrated));
                   }
