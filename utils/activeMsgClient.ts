@@ -25,8 +25,9 @@ import {
 } from './amsg2Tasks';
 import { AMSG_CHAT_PRESENCE_KEY, AmsgChatPresence } from './amsgChatPresence';
 import {
-  AmsgDiagnosticsProbe, AmsgFailKind, describeAmsgFetchFailure, parseAmsgDebugReport,
+  AmsgDiagnosticsProbe, AmsgFailKind, type AmsgTickReportResult, describeAmsgFetchFailure, parseAmsgDebugReport,
 } from './amsgDiagnostics';
+import { parseAmsgTickReport } from './amsgTickReport';
 // 「这个角色欠着一条即时对话回复吗」的两个原始信号（待收记录 + 发送在飞）。
 // amsgInstantChat 反过来也 import 这个文件，两边都只在函数体里用对方，模块求值期
 // 谁都不碰谁，所以这个环是安全的；换成在这里另读一遍 localStorage 才是真麻烦
@@ -100,7 +101,7 @@ import { listRecallableMonths } from './agenticTools';
 import { ChatPrompts } from './chatPrompts';
 import { nowInTimeZone, resolveCharTimeZone, tzAwarenessNote } from './timezone';
 import { DB } from './db';
-import { copyWorkerBundleToClipboard } from './instantPushClient';
+import { copyWorkerBundleToClipboard } from './workerDeploy';
 import { collectMcpFireServers, getMcpUseNativeTools } from './mcpClient';
 import { safeResponseJson } from './safeApi';
 import { ActiveMsgStore } from './activeMsgStore';
@@ -323,6 +324,43 @@ export const fetchWorkerDiagnostics = async (): Promise<AmsgDiagnosticsProbe> =>
   } catch (error: any) {
     // fetchWithAuthRaw 抛出来的已经是人话了（见 amsgDiagnostics 的 describeAmsgFetchFailure）。
     return { reachable: false, reason: error?.message || '连不上 Worker。' };
+  }
+};
+
+/**
+ * 拉一次定时任务细账（`GET /tick-report`，形状见 amsgTickReport.ts）。
+ *
+ * 体检「定时任务」那一行靠它把「到点没发」拆成逐条的原因。跟 /debug 并排拉，所以
+ * 失败也不抛：那一行照旧按 /debug 的两个数给笼统结论，这里的原因挂在下面，
+ * 让人知道为什么没有逐条的。
+ */
+export const fetchWorkerTickReport = async (): Promise<AmsgTickReportResult> => {
+  let config: ActiveMsg2GlobalConfig;
+  try {
+    config = await ensureWorkerReady();
+  } catch (error: any) {
+    return { ok: false, reason: error?.message || '还没填 Worker 地址。' };
+  }
+
+  try {
+    // 超时的理由同 fetchWorkerDiagnostics：两边是一起等的，这边干等会拖住整块体检。
+    const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(8000) : undefined;
+    const { status, body } = await fetchWithAuthRaw('tick-report', config, { method: 'GET', signal }, '体检');
+    const report = status === 200 ? parseAmsgTickReport(body) : null;
+    if (report) return { ok: true, report };
+
+    if (status === 401 || status === 403) {
+      return { ok: false, reason: `Worker 拒绝了读定时任务细账的请求（HTTP ${status}），多半是共享密钥两边对不上。` };
+    }
+    // 端点在、但查的时候自己出了错（读库失败之类）：这跟「代码太旧」是两回事，原话带上。
+    if (status >= 500) {
+      const message = typeof body?.error?.message === 'string' ? body.error.message : '';
+      return { ok: false, reason: `Worker 查定时任务细账时出错了（HTTP ${status}）${message ? `：${message}` : '。'}` };
+    }
+    // 404，或者 200 但形状对不上：这台 Worker 上还没有这个端点。
+    return { ok: false, reason: '没拿到每条任务的细账（Worker 上的代码可能还不是最新，点上面的「更新 Worker」）。' };
+  } catch (error: any) {
+    return { ok: false, reason: error?.message || '连不上 Worker。' };
   }
 };
 
@@ -1383,9 +1421,8 @@ const buildToolConfigEntry = (
  * 退订后要等浏览器清内部 removed 标记（SUBSCRIBE_SETTLE_MS），否则紧接着的
  * subscribe() 又拿到死哨兵。
  *
- * 判定口径与 instantPushClient.getOrCreateInstantSubscription /
- * proactivePushConfig.getOrCreateSubscription 的内联实现一致；那两处在各自文件里，
- * 将来合并时以这份抽出来的函数为准。export 供单测 mock pushManager 钉行为。
+ * 判定口径与 proactivePushConfig.getOrCreateSubscription 的内联实现一致；那一处在
+ * 它自己的文件里，将来合并时以这份抽出来的函数为准。export 供单测 mock pushManager 钉行为。
  */
 export const dropStaleSubscription = async (
   sub: PushSubscription | null,
@@ -1406,7 +1443,7 @@ export const dropStaleSubscription = async (
     }
   } catch {
     // 公钥读不出来（个别浏览器不暴露 options）就按可复用处理——
-    // 与 instant / proactive 两处同款 fall-through。
+    // 与 proactive 那处同款 fall-through。
   }
   return sub;
 };
@@ -1522,7 +1559,7 @@ const REQUEST_GZIP_THRESHOLD_BYTES = 16 * 1024;
 /**
  * 超阈值的请求体先 gzip 再上网线。
  *
- * 收益比 instant-push 那条路小一截，得说清楚：这里的正文进 HTTP 之前已经是**密文**，
+ * 收益有限，得说清楚：这里的正文进 HTTP 之前已经是**密文**，
  * 而 fire_pack 真正的压缩早在交给上游加密之前就做过了（见 amsgFirePack 的
  * packStateValue，省 60%）。所以这一层压掉的只是密文那层 base64 的膨胀，约 25%。
  * 慢网和 iOS 上行那几秒里，这 25% 仍然是实打实少传的字节。
@@ -1742,7 +1779,7 @@ export const ActiveMsgClient = {
         };
       }
     }
-    // 能力检测与 instant push / proactive push 共用 describePushCapabilityGap：
+    // 能力检测与 proactive push 共用 describePushCapabilityGap：
     // 它会说清缺的是三件套里的哪一件，「不支持」这三个字用户拿着没法action。
     const capabilityGap = describePushCapabilityGap();
     if (capabilityGap) {
@@ -2194,7 +2231,8 @@ export const ActiveMsgClient = {
    * 客户端落库之后销账。所以这里不做任何本地对账，读回来是什么就是什么。
    *
    * 读失败照常抛：调用方要能分清「读到了、里面确实没有」和「压根没读成」，
-   * 后者不构成任何结论（见 docs/instant-push-dual-channel.md 那条铁律）。
+   * 后者不构成任何结论——网络抖一下、请求被掐断都会读失败，消息可能好好地躺在账本上，
+   * 拿它判「消息没了 / 发送失败」就是误判。
    */
   async listOutboxEntries(): Promise<AmsgOutboxEntry[]> {
     const config = await ensureWorkerReady();
@@ -2949,7 +2987,7 @@ export const ActiveMsgClient = {
     // getAll（表情记录带图片数据），拿回来的还是同一份。
     const emojiLibrary = await readEmojiLibrary();
     const entries = [];
-    // 逐个串行：并发跑会同时开 N 个 IDB 事务，正是 instant push 那次超时的连接风暴成因。
+    // 逐个串行：并发跑会同时开 N 个 IDB 事务，容易撞上 IndexedDB 连接风暴（写失败、确认超时）。
     for (const item of items) {
       const firePack = await buildFirePack(
         item.char, item.userProfile, item.groups, item.realtimeConfig, emojiLibrary,
@@ -3118,6 +3156,73 @@ export const ActiveMsgClient = {
    */
   async putLlmCredentials(rows: LlmCredentialRow[], options?: { force?: boolean }): Promise<number> {
     return putLlmCredentialRows(rows, options ?? {});
+  },
+
+  /**
+   * 列出云端 client_state 里有哪些命名空间，各占多少。给「云端数据」清点用。
+   *
+   * 这是唯一一条能发现「本地已经没有、云端只剩一份上下文」的角色的线索：任务表和凭据
+   * 表都问不到它们（没排过任务、没配过单独 API），而角色命名空间在 worker 侧没有 TTL，
+   * 不主动去看就永远不知道它在那儿。
+   *
+   * 要用户那台 worker 更新到带 `client-state-namespaces` 的版本。老 worker 上那条路由
+   * 不存在，直接问会拿到一句没法解释的 404——所以先问 capabilities，缺能力时抛一句
+   * 说得清的话，界面照它提示「更新 Worker 之后清单会更全」。
+   *
+   * 这一趟要在 worker 上按用户扫一遍 client_state，所以只在用户点开清点界面时调，
+   * 别塞进体检或者任何定时路径（每分钟白扫一遍 D1 就是 rows read 被扫穿的来由）。
+   */
+  async listCloudNamespaces(): Promise<Array<{
+    namespace: string; entryCount: number; byteSize: number; updatedAt: number | null;
+  }>> {
+    const config = await ensureWorkerReady();
+    const client = await initializeClient(config);
+    const features = await this.getCapabilities().then((c) => c?.features ?? null).catch(() => null);
+    if (!features?.includes('client-state-namespaces')) {
+      throw new Error('这台 Worker 还没有「列出云端命名空间」的能力，更新 Worker 之后清单会更全。');
+    }
+    const response = await fetchWithAuth('client-state/namespaces', config, {
+      method: 'GET',
+      headers: {
+        'X-Response-Encrypted': 'true',
+        'X-Encryption-Version': '1',
+      },
+    }, '读取云端命名空间清单');
+    if (!response?.success) {
+      throw new Error(response?.error?.message || '读取云端命名空间清单失败。');
+    }
+    const payload = await decryptPayload(client, response.data) as {
+      namespaces?: Array<{ namespace?: unknown; entryCount?: unknown; byteSize?: unknown; updatedAt?: unknown }>;
+    };
+    return (payload?.namespaces ?? [])
+      .filter((row): row is { namespace: string } & Record<string, unknown> => typeof row?.namespace === 'string' && !!row.namespace)
+      .map((row) => ({
+        namespace: row.namespace,
+        entryCount: Number(row.entryCount ?? 0) || 0,
+        byteSize: Number(row.byteSize ?? 0) || 0,
+        updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : null,
+      }));
+  },
+
+  /**
+   * 列出云端登记着哪些凭据行。上游只回 credId 和更新时间，**不回凭据本体**。
+   *
+   * credId 的形状是 `char:<charId>/<用途>`，角色身份就编在这个字符串里——所以这是眼下
+   * 唯一一个「不靠本地记录，直接问云端还记着哪些角色」的口子。任务表那边角色 id 埋在
+   * 密文里，要把全部任务拉回来逐条解密才看得见；client_state 则要等用户那台 worker
+   * 更新到带命名空间清单的那一版。
+   */
+  async listLlmCredentials(): Promise<Array<{ credId: string; updatedAt?: number }>> {
+    const config = await ensureWorkerReady();
+    const client = await initializeClient(config);
+    const response = await client.listLlmCredentials();
+    if (!response?.success) {
+      throw new Error(response?.error?.message || '读取云端凭据清单失败。');
+    }
+    const rows = (response.data as { credentials?: Array<{ credId?: unknown; updatedAt?: unknown }> })?.credentials ?? [];
+    return rows
+      .filter((row): row is { credId: string; updatedAt?: number } => typeof row?.credId === 'string' && !!row.credId)
+      .map((row) => ({ credId: row.credId, updatedAt: typeof row.updatedAt === 'number' ? row.updatedAt : undefined }));
   },
 
   /**
@@ -3526,9 +3631,13 @@ export const ActiveMsgClient = {
    * 「任务还活着、凭据却没了」的唯一入口，堵住这里就够。
    *
    * 补传失败不算清空失败（清空确实成功了），返回值把结果交给调用方去提示。
+   *
+   * `restoreToolConfig: false` 用在「重置全部数据」那条路上：那时用户要的是一切归零，
+   * 本地紧接着就要删库，补传只会在刚清空的库里重新留下一行谁也不会再读的凭据。
    */
   async clearClientState(
     realtimeConfig: RealtimeConfig | undefined,
+    options: { restoreToolConfig?: boolean } = {},
   ): Promise<{ deleted: number; toolConfigRestored: boolean }> {
     const config = await ensureWorkerReady();
     // 清云端状态可能连用户密钥一起换代：握手缓存作废，之后的第一次调用重新 init。
@@ -3539,6 +3648,7 @@ export const ActiveMsgClient = {
       throw new Error(response?.error?.message || '清除云端状态失败。');
     }
     const { deleted } = response.data as { deleted: number };
+    if (options.restoreToolConfig === false) return { deleted, toolConfigRestored: false };
 
     let toolConfigRestored = true;
     try {

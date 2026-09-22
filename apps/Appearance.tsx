@@ -18,8 +18,10 @@ import { resolveStatusBarMode, type StatusBarMode } from '../utils/iosStandalone
 import { confirmExportSafety } from '../utils/exportGuard';
 import { trackEvent } from '../utils/analytics';
 import { Check, ImageSquare, Sparkle, Trash, UploadSimple } from '@phosphor-icons/react';
-import { ChatAppearanceEditor as ModularChatAppearanceEditor } from '../components/appearance/ChatAppearanceEditor';
+import ChatDecorationAnnouncement from '../components/chat/ChatDecorationAnnouncement';
 import AppIconEditor from '../components/appearance/AppIconEditor';
+import BootAnimationSettings from '../components/appearance/BootAnimationSettings';
+import FullscreenSettings from '../components/appearance/FullscreenSettings';
 import { shareOrDownloadBlob } from '../utils/shareExport';
 import { readShareFile } from '../utils/pngShare';
 
@@ -479,7 +481,7 @@ const PresetManager: React.FC<PresetManagerProps> = ({ presets, onSave, onApply,
 
 const Appearance: React.FC = () => {
   const { theme, updateTheme, closeApp, openApp, setCustomIcon, customIcons, addToast, appearancePresets, saveAppearancePreset, applyAppearancePreset, deleteAppearancePreset, renameAppearancePreset, exportAppearancePreset, importAppearancePreset, characters, activeCharacterId, updateCharacter } = useOS();
-  const [activeTab, setActiveTab] = useState<'theme' | 'icons' | 'presets' | 'chat'>('theme');
+  const [activeTab, setActiveTab] = useState<'theme' | 'icons' | 'presets'>('theme');
   const wallpaperInputRef = useRef<HTMLInputElement>(null);
   const [wallpaperUrl, setWallpaperUrl] = useState('');
   const lockWallpaperInputRef = useRef<HTMLInputElement>(null);
@@ -854,6 +856,7 @@ const Appearance: React.FC = () => {
 
   return (
     <div className="h-full w-full bg-slate-50 flex flex-col font-light">
+      <ChatDecorationAnnouncement surface="appearance"/>
       <div className="bg-white/70 backdrop-blur-md border-b border-white/40 shrink-0 z-10 sticky top-0" style={{ paddingTop: 'var(--safe-top)' }}>
         <div className="flex items-center px-4 py-3">
           <div className="flex items-center gap-2 w-full">
@@ -871,7 +874,6 @@ const Appearance: React.FC = () => {
           <button onClick={() => { setActiveTab('theme'); trackEvent('切换外观定制标签页', { tab: 'theme' }); }} className={`flex-1 py-3 text-sm font-medium transition-colors ${activeTab === 'theme' ? 'text-primary border-b-2 border-primary' : 'text-slate-400'}`}>系统主题</button>
           <button onClick={() => { setActiveTab('icons'); trackEvent('切换外观定制标签页', { tab: 'icons' }); }} className={`flex-1 py-3 text-sm font-medium transition-colors ${activeTab === 'icons' ? 'text-primary border-b-2 border-primary' : 'text-slate-400'}`}>应用图标</button>
           <button onClick={() => { setActiveTab('presets'); trackEvent('切换外观定制标签页', { tab: 'presets' }); }} className={`flex-1 py-3 text-sm font-medium transition-colors ${activeTab === 'presets' ? 'text-primary border-b-2 border-primary' : 'text-slate-400'}`}>外观预设</button>
-          <button onClick={() => { setActiveTab('chat'); trackEvent('切换外观定制标签页', { tab: 'chat' }); }} className={`flex-1 py-3 text-sm font-medium transition-colors ${activeTab === 'chat' ? 'text-primary border-b-2 border-primary' : 'text-slate-400'}`}>聊天界面</button>
       </div>
 
       <div className="flex-1 overflow-y-auto p-5 space-y-6 no-scrollbar">
@@ -885,7 +887,7 @@ const Appearance: React.FC = () => {
                             {
                                 key: 'bootAnimationEnabled' as const,
                                 title: '开机动画',
-                                description: '启动 SullyOS 时的整机入场过场。',
+                                description: '启动 SullyOS·糯米机 时的整机入场过场。',
                             },
                             {
                                 key: 'chatCharacterSwitchAnimationEnabled' as const,
@@ -1145,6 +1147,17 @@ const Appearance: React.FC = () => {
                 {/* Global Font Section */}
                 <section className="bg-white rounded-3xl p-5 shadow-sm border border-slate-100">
                     <h2 className="text-sm font-bold text-slate-400 uppercase tracking-widest mb-4">全局字体 (Global Font)</h2>
+                    <div className="mb-5">
+                        <div className="text-xs text-slate-500 mb-2">首页时间字体（更换壁纸时保持）</div>
+                        <div className="flex gap-2">
+                            {([['serif', '经典衬线'], ['bold', '粗体数字'], ['system', '跟随全局字体']] as const).map(([value, label]) => (
+                                <button key={value} onClick={() => updateTheme({ desktopClockStyle: value })}
+                                    className={`flex-1 py-2 rounded-xl text-xs ${(theme.desktopClockStyle || (theme.desktopVariant === 'nostalgia' ? 'bold' : 'serif')) === value ? 'bg-primary text-white' : 'bg-slate-100 text-slate-500'}`}>
+                                    {label}
+                                </button>
+                            ))}
+                        </div>
+                    </div>
                     
                     <div className="flex bg-slate-100 p-1 rounded-xl mb-4">
                         <button onClick={() => setFontMode('local')} className={`flex-1 py-1.5 text-xs font-bold rounded-lg transition-all ${fontMode === 'local' ? 'bg-white text-primary shadow-sm' : 'text-slate-400'}`}>本地文件</button>
@@ -1197,6 +1210,8 @@ const Appearance: React.FC = () => {
                         <button onClick={() => updateTheme({ customFont: undefined })} className="w-full py-2 text-xs font-bold text-red-400 bg-red-50 rounded-lg hover:bg-red-100 mt-2">恢复默认字体</button>
                     )}
                 </section>
+
+                <FullscreenSettings />
 
                 {/* Status Bar Layout */}
                 <section className="bg-white rounded-3xl p-5 shadow-sm border border-slate-100">
@@ -1363,6 +1378,7 @@ const Appearance: React.FC = () => {
                             应用网络锁屏壁纸
                         </button>
                     </div>
+                <BootAnimationSettings theme={theme} updateTheme={updateTheme} />
                 </section>
 
                 {/* Page 1 Desktop Square Image */}
@@ -1745,8 +1761,7 @@ const Appearance: React.FC = () => {
                 addToast={addToast}
                 currentTheme={theme}
             />
-        ) : activeTab === 'chat' ? (
-            <ModularChatAppearanceEditor theme={theme} updateTheme={updateTheme} onOpenApp={openApp} />
+
         ) : null}
       </div>
     </div>
